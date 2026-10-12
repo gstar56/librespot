@@ -44,6 +44,22 @@ impl ConnectState {
         }
     }
 
+    /// Merges player modes into the reported options, keeping the others. A
+    /// Jam's start and end arrive as `set_options` carrying only
+    /// `{"modes": {"jam": "on" | "off"}}`; without merging, the device would
+    /// keep reporting the modes of the last transfer.
+    pub fn merge_modes(&mut self, modes: impl IntoIterator<Item = (String, String)>) {
+        self.add_options_if_empty();
+        if let Some(options) = self.player_mut().options.as_mut() {
+            options.modes.extend(modes);
+        }
+    }
+
+    /// The value of a player mode, such as `jam`.
+    pub fn mode(&self, mode: &str) -> Option<&str> {
+        self.player().options.modes.get(mode).map(String::as_str)
+    }
+
     pub fn reset_options(&mut self) {
         self.set_shuffle(false);
         self.set_repeat_track(false);

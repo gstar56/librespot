@@ -20,6 +20,7 @@ use crate::{
         connect::{Cluster, ClusterUpdate, LogoutCommand, SetVolumeCommand},
         context::Context,
         explicit_content_pubsub::UserAttributesUpdate,
+        player::ProvidedTrack,
         playlist4_external::PlaylistModificationInfo,
         social_connect_v2::SessionUpdate,
         transfer_state::TransferState,
@@ -110,6 +111,81 @@ struct SpircTask {
     update_state: bool,
 
     spirc_id: usize,
+
+    /// A Jam guest paused just for themselves. The Jam's commands still move
+    /// [`Self::jam_clock`], but don't start this device until the hold ends.
+    jam_hold: bool,
+    /// Where the Jam is, as of the last command social-connect relayed.
+    jam_clock: Option<JamClock>,
+}
+
+/// A Jam's playhead, extrapolated from the last command it sent.
+#[derive(Clone, Debug, PartialEq)]
+struct JamClock {
+    uri: String,
+    position_ms: u32,
+    timestamp: i64,
+    paused: bool,
+}
+
+impl JamClock {
+    fn position_at(&self, now: i64) -> u32 {
+        if self.paused {
+            return self.position_ms;
+        }
+        let elapsed = (now - self.timestamp).clamp(0, 60 * 60 * 1000);
+        self.position_ms.saturating_add(elapsed as u32)
+    }
+
+    /// Follows a relayed command that moves the playhead without a transfer.
+    fn follow(&mut self, command: &Command, current_uri: &str, now: i64) {
+        match command {
+            Command::Pause(_) => {
+                self.position_ms = self.position_at(now);
+                self.paused = true;
+            }
+            Command::Resume(_) => self.paused = false,
+            Command::SeekTo(seek_to) => self.position_ms = seek_to.value,
+            Command::SkipNext(_) | Command::SkipPrev(_) => {
+                self.uri = current_uri.to_owned();
+                self.position_ms = 0;
+                self.paused = false;
+            }
+            Command::Play(play) => {
+                self.uri = current_uri.to_owned();
+                self.position_ms = play.options.seek_to.unwrap_or_default();
+                self.paused = false;
+            }
+            _ => return,
+        }
+        self.timestamp = now;
+    }
+}
+
+/// Commands from a Jam arrive from this virtual device.
+fn sent_by_jam(device_id: &str) -> bool {
+    device_id.starts_with("social-connect")
+}
+
+/// How far a continuing transfer's position may be from ours before it counts
+/// as a seek. Both sides extrapolate the position from their own clocks.
+const TRANSFER_SEEK_TOLERANCE_MS: i64 = 3000;
+
+/// Whether a transfer names the stream that is already playing, so it can be
+/// adopted around that stream instead of loading the track again.
+///
+/// A Jam relays every participant's edit as a transfer of the whole Jam that
+/// retains the original session and names the playing track. Loading it again
+/// would restart the song on every queued track or skip by anyone in the Jam.
+fn continues_stream(
+    retain_session: Option<&str>,
+    playing: &ProvidedTrack,
+    next: &ProvidedTrack,
+) -> bool {
+    retain_session == Some("retain_original")
+        && !playing.uri.is_empty()
+        && playing.uri == next.uri
+        && (playing.uid.is_empty() || next.uid.is_empty() || playing.uid == next.uid)
 }
 
 static SPIRC_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -136,6 +212,7 @@ enum SpircCommand {
     Activate,
     Transfer(Option<TransferRequest>),
     Load(LoadRequest),
+    JamHold(bool),
 }
 
 const CONTEXT_FETCH_THRESHOLD: usize = 2;
@@ -319,6 +396,9 @@ impl Spirc {
             update_state: false,
 
             spirc_id,
+
+            jam_hold: false,
+            jam_clock: None,
         };
 
         let spirc = Spirc {
@@ -478,6 +558,13 @@ impl Spirc {
     /// Does nothing if we are not the active device.
     pub fn disconnect(&self, pause: bool) -> Result<(), Error> {
         Ok(self.commands.send(SpircCommand::Disconnect { pause })?)
+    }
+
+    /// Pauses a Jam guest just for themselves (`true`), or rejoins the Jam
+    /// where it is now (`false`). While held, the Jam's commands still move
+    /// the track and position but don't start playback here.
+    pub fn set_jam_hold(&self, hold: bool) -> Result<(), Error> {
+        Ok(self.commands.send(SpircCommand::JamHold(hold))?)
     }
 
     /// Acquires the control as active connect device.
@@ -776,6 +863,12 @@ impl SpircTask {
             // `set_volume` records it in the device state and the mixer and
             // withholds the player event, and activation then reports it.
             SpircCommand::SetVolume(volume) => self.set_volume(volume),
+            SpircCommand::JamHold(hold) => {
+                self.handle_jam_hold(hold);
+                if !self.connect_state.is_active() {
+                    return Ok(());
+                }
+            }
             _ if !self.connect_state.is_active() => {
                 warn!("SpircCommand::{cmd:?} will be ignored while Not Active")
             }
@@ -784,6 +877,10 @@ impl SpircTask {
                     self.handle_pause()
                 }
                 return self.handle_disconnect().await;
+            }
+            // resuming after a guest's own pause rejoins the Jam where it is
+            SpircCommand::Play | SpircCommand::PlayPause if self.jam_hold => {
+                self.handle_jam_hold(false)
             }
             SpircCommand::Play => self.handle_play(),
             SpircCommand::PlayPause => self.handle_play_pause(),
@@ -798,7 +895,10 @@ impl SpircTask {
             SpircCommand::Repeat(repeat) => self.handle_repeat_context(repeat)?,
             SpircCommand::RepeatTrack(repeat) => self.handle_repeat_track(repeat),
             SpircCommand::SetPosition(position) => self.handle_seek(position),
-            SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
+            SpircCommand::Load(command) => {
+                self.jam_hold = false;
+                self.handle_load(command, None, None).await?
+            }
         };
 
         self.notify().await
@@ -982,7 +1082,7 @@ impl SpircTask {
         use protobuf::Message;
 
         match TransferState::parse_from_bytes(&cluster.transfer_data) {
-            Ok(transfer_state) => self.handle_transfer(transfer_state)?,
+            Ok(transfer_state) => self.handle_transfer(transfer_state, None, false)?,
             Err(why) => error!("failed to take over control: {why}"),
         }
 
@@ -1092,7 +1192,28 @@ impl SpircTask {
     async fn handle_request(&mut self, request: Request) -> Result<(), Error> {
         use Command::*;
 
-        match request.command {
+        let from_jam = sent_by_jam(&request.sent_by_device_id);
+        let followed = from_jam.then(|| request.command.clone());
+
+        self.apply_request(request.command, from_jam).await?;
+
+        if let Some(command) = followed {
+            let current = self.connect_state.current_track(|t| t.uri.clone());
+            let now = self.now_ms();
+            if let Some(clock) = self.jam_clock.as_mut() {
+                clock.follow(&command, &current, now);
+            }
+            if matches!(command, Transfer(_)) {
+                return self.notify().await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_request(&mut self, command: Command, from_jam: bool) -> Result<(), Error> {
+        use Command::*;
+
+        match command {
             // errors and unknown commands
             Transfer(transfer) if transfer.data.is_none() => {
                 warn!("transfer endpoint didn't contain any data to transfer");
@@ -1119,7 +1240,15 @@ impl SpircTask {
             }
             // modification and update of the connect_state
             Transfer(transfer) => {
-                self.handle_transfer(transfer.data.expect("by condition checked"))?;
+                self.handle_transfer(
+                    transfer.data.expect("by condition checked"),
+                    transfer.options.retain_session.as_deref(),
+                    from_jam,
+                )?;
+                if from_jam {
+                    // notified once the clock has followed it
+                    return Ok(());
+                }
                 return self.notify().await;
             }
             Play(mut play) => {
@@ -1197,6 +1326,14 @@ impl SpircTask {
                 if let Some(shuffle) = shuffle {
                     self.handle_shuffle(shuffle)?;
                 }
+
+                if let Some(modes) = set_options.modes {
+                    self.connect_state.merge_modes(modes);
+                    if self.connect_state.mode("jam") == Some("off") {
+                        self.jam_hold = false;
+                        self.jam_clock = None;
+                    }
+                }
             }
             SkipNext(skip_next) => self.handle_next(skip_next.track.map(|t| t.uri))?,
             SkipPrev(_) => self.handle_prev()?,
@@ -1210,7 +1347,28 @@ impl SpircTask {
         Ok(())
     }
 
-    fn handle_transfer(&mut self, mut transfer: TransferState) -> Result<(), Error> {
+    fn handle_transfer(
+        &mut self,
+        mut transfer: TransferState,
+        retain_session: Option<&str>,
+        from_jam: bool,
+    ) -> Result<(), Error> {
+        let continuing = self.connect_state.is_active()
+            && !matches!(self.play_status, SpircPlayStatus::Stopped)
+            && match (
+                self.connect_state.player().track.as_ref(),
+                self.connect_state.current_track_from_transfer(&transfer),
+            ) {
+                (Some(playing), Ok(next)) => continues_stream(retain_session, playing, &next),
+                _ => false,
+            };
+
+        if retain_session == Some("retain_original") {
+            // the transfer carries the whole queue; keeping ours too would
+            // list every queued track twice
+            self.connect_state.clear_queue();
+        }
+
         let mut ctx_uri = match transfer.current_session.context.uri {
             None => Err(SpircError::NoUri("transfer context"))?,
             // can apparently happen when a state is transferred and was started with "uris" via the api
@@ -1271,7 +1429,9 @@ impl SpircTask {
             }
         };
 
-        self.handle_activate();
+        if !continuing {
+            self.handle_activate();
+        }
 
         let timestamp = self.now_ms();
         let state = &mut self.connect_state;
@@ -1329,11 +1489,51 @@ impl SpircTask {
             }
         }
 
+        if from_jam {
+            self.jam_clock = Some(JamClock {
+                uri: self.connect_state.current_track(|t| t.uri.clone()),
+                position_ms: position.try_into().unwrap_or_default(),
+                timestamp,
+                paused: !is_playing,
+            });
+        }
+
+        if continuing {
+            debug!("transfer continues the playing stream");
+            return self.continue_stream(is_playing, position);
+        }
+
         self.load_track(is_playing, position.try_into()?)
+    }
+
+    /// Adopts a transfer around the stream already playing: no new load, no
+    /// gap, and a seek only when the position really moved.
+    fn continue_stream(&mut self, is_playing: bool, position: i64) -> Result<(), Error> {
+        let current = i64::from(self.position());
+        if (current - position).abs() > TRANSFER_SEEK_TOLERANCE_MS {
+            self.handle_seek(position.try_into()?);
+        }
+
+        let playing_here = matches!(
+            self.play_status,
+            SpircPlayStatus::Playing { .. } | SpircPlayStatus::LoadingPlay { .. }
+        );
+        match (is_playing, playing_here) {
+            (true, false) => self.handle_play(),
+            (false, true) => self.handle_pause(),
+            _ => {}
+        }
+
+        let position = self.position();
+        self.connect_state.update_position(position, self.now_ms());
+        self.connect_state.set_status(&self.play_status);
+        Ok(())
     }
 
     async fn handle_disconnect(&mut self) -> Result<(), Error> {
         self.context_resolver.clear();
+        self.jam_hold = false;
+        self.jam_clock = None;
 
         self.play_status = SpircPlayStatus::Stopped {};
         self.connect_state
@@ -1557,6 +1757,10 @@ impl SpircTask {
     }
 
     fn handle_play(&mut self) {
+        if self.jam_hold {
+            debug!("not playing: the Jam is on hold here");
+            return;
+        }
         match self.play_status {
             SpircPlayStatus::Paused {
                 position_ms,
@@ -1581,6 +1785,28 @@ impl SpircTask {
         // systems that can switch sources from and back to librespot.
         let current_volume = self.mixer.volume();
         self.set_volume(current_volume);
+    }
+
+    /// A Jam guest pausing just for themselves, or catching back up with the
+    /// Jam, which kept going.
+    fn handle_jam_hold(&mut self, hold: bool) {
+        if hold {
+            self.handle_pause();
+            self.jam_hold = true;
+            return;
+        }
+
+        self.jam_hold = false;
+        if let Some(clock) = self.jam_clock.clone() {
+            if self.connect_state.current_track(|t| t.uri == clock.uri) {
+                self.handle_seek(clock.position_at(self.now_ms()));
+                if clock.paused {
+                    // the Jam itself is paused: rejoin it paused
+                    return;
+                }
+            }
+        }
+        self.handle_play();
     }
 
     fn handle_play_pause(&mut self) {
@@ -1900,6 +2126,8 @@ impl SpircTask {
     }
 
     fn load_track(&mut self, start_playing: bool, position_ms: u32) -> Result<(), Error> {
+        // a Jam guest's own pause holds across the Jam's track changes
+        let start_playing = start_playing && !self.jam_hold;
         if self.connect_state.current_track(MessageField::is_none) {
             debug!("current track is none, stopping playback");
             self.handle_stop();
@@ -2000,5 +2228,163 @@ mod recovery_tests {
             .unwrap();
         assert!(state.repeat_context());
         assert_eq!(resolver.pending(), [pending]);
+    }
+}
+
+#[cfg(test)]
+mod jam_tests {
+    use super::*;
+
+    fn track(uri: &str, uid: &str) -> ProvidedTrack {
+        ProvidedTrack {
+            uri: uri.into(),
+            uid: uid.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_jam_edit_naming_the_playing_track_continues_its_stream() {
+        let playing = track("spotify:track:a", "u0");
+        assert!(continues_stream(
+            Some("retain_original"),
+            &playing,
+            &track("spotify:track:a", "u0")
+        ));
+        // a uid missing on either side still names the same stream
+        assert!(continues_stream(
+            Some("retain_original"),
+            &playing,
+            &track("spotify:track:a", "")
+        ));
+    }
+
+    #[test]
+    fn a_cast_a_skip_or_the_same_song_listed_twice_loads_again() {
+        let playing = track("spotify:track:a", "u0");
+        // a user casting onto the device does not retain the session
+        assert!(!continues_stream(
+            Some("do_not_retain"),
+            &playing,
+            &track("spotify:track:a", "u0")
+        ));
+        assert!(!continues_stream(
+            None,
+            &playing,
+            &track("spotify:track:a", "u0")
+        ));
+        // a skip names the next track
+        assert!(!continues_stream(
+            Some("retain_original"),
+            &playing,
+            &track("spotify:track:b", "u1")
+        ));
+        // the same song at another place in the list
+        assert!(!continues_stream(
+            Some("retain_original"),
+            &playing,
+            &track("spotify:track:a", "u9")
+        ));
+        // nothing plays yet
+        assert!(!continues_stream(
+            Some("retain_original"),
+            &track("", ""),
+            &track("", "")
+        ));
+    }
+
+    fn command(json: serde_json::Value) -> Command {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn the_jam_clock_follows_relayed_commands() {
+        let mut clock = JamClock {
+            uri: "spotify:track:a".into(),
+            position_ms: 10_000,
+            timestamp: 1_000,
+            paused: false,
+        };
+        assert_eq!(clock.position_at(3_000), 12_000);
+
+        clock.follow(
+            &command(serde_json::json!({"endpoint": "pause", "logging_params": {}})),
+            "spotify:track:a",
+            4_000,
+        );
+        assert!(clock.paused);
+        assert_eq!(clock.position_at(60_000), 13_000);
+
+        clock.follow(
+            &command(serde_json::json!({"endpoint": "resume", "logging_params": {}})),
+            "spotify:track:a",
+            70_000,
+        );
+        assert_eq!(clock.position_at(71_000), 14_000);
+
+        clock.follow(
+            &command(serde_json::json!({
+                "endpoint": "seek_to", "value": 30_000, "position": 30_000, "logging_params": {}
+            })),
+            "spotify:track:a",
+            80_000,
+        );
+        assert_eq!(clock.position_at(80_500), 30_500);
+
+        clock.follow(
+            &command(serde_json::json!({"endpoint": "skip_next", "logging_params": {}})),
+            "spotify:track:b",
+            90_000,
+        );
+        assert_eq!(clock.uri, "spotify:track:b");
+        assert_eq!(clock.position_at(91_000), 1_000);
+    }
+
+    #[test]
+    fn the_jam_clock_never_runs_backwards_or_without_bound() {
+        let clock = JamClock {
+            uri: "spotify:track:a".into(),
+            position_ms: 5_000,
+            timestamp: 10_000,
+            paused: false,
+        };
+        assert_eq!(clock.position_at(9_000), 5_000);
+        assert_eq!(clock.position_at(i64::MAX), 5_000 + 60 * 60 * 1000);
+    }
+
+    #[test]
+    fn jam_commands_come_from_social_connect() {
+        assert!(sent_by_jam(
+            "social-connect-1ce14fef83e5a794b92abe1681e910d9"
+        ));
+        assert!(!sent_by_jam("8a1e7c3b5d"));
+    }
+
+    #[tokio::test]
+    async fn a_set_options_carrying_only_modes_parses_and_merges() {
+        let Command::SetOptions(set_options) = command(serde_json::json!({
+            "endpoint": "set_options",
+            "modes": {"jam": "off"}
+        })) else {
+            panic!("not set_options");
+        };
+        assert!(set_options.repeating_context.is_none());
+
+        let session = Session::new(Default::default(), None);
+        let mut state = ConnectState::new(Default::default(), &session);
+        state.set_repeat_context(true);
+        state.merge_modes([
+            ("jam".to_owned(), "on".to_owned()),
+            ("context_enhancement".to_owned(), "NONE".to_owned()),
+        ]);
+        assert_eq!(state.mode("jam"), Some("on"));
+
+        state.merge_modes(set_options.modes.unwrap());
+        assert_eq!(state.mode("jam"), Some("off"));
+        assert_eq!(state.mode("context_enhancement"), Some("NONE"));
+        assert!(
+            state.repeat_context(),
+            "modes leave the other options alone"
+        );
     }
 }
