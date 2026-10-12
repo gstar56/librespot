@@ -89,6 +89,7 @@ pub struct TransferCommand {
     pub data: Option<TransferState>,
     pub options: TransferOptions,
     pub from_device_identifier: String,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub logging_params: LoggingParams,
 }
 
@@ -99,12 +100,14 @@ pub struct PlayCommand {
     #[serde(deserialize_with = "json_proto")]
     pub play_origin: PlayOrigin,
     pub options: PlayOptions,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub logging_params: LoggingParams,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct PauseCommand {
     // does send options with it, but seems to be empty, investigate which options are send here
+    #[serde(default, deserialize_with = "null_as_default")]
     pub logging_params: LoggingParams,
 }
 
@@ -112,6 +115,7 @@ pub struct PauseCommand {
 pub struct SeekToCommand {
     pub value: u32,
     pub position: u32,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub logging_params: LoggingParams,
 }
 
@@ -119,12 +123,14 @@ pub struct SeekToCommand {
 pub struct SkipNextCommand {
     #[serde(default, deserialize_with = "option_json_proto")]
     pub track: Option<ProvidedTrack>,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub logging_params: LoggingParams,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct SetValueCommand {
     pub value: bool,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub logging_params: LoggingParams,
 }
 
@@ -132,6 +138,7 @@ pub struct SetValueCommand {
 pub struct AddToQueueCommand {
     #[serde(deserialize_with = "json_proto")]
     pub track: ProvidedTrack,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub logging_params: LoggingParams,
 }
 
@@ -144,6 +151,7 @@ pub struct SetQueueCommand {
     // this queue revision is actually the last revision, so using it will not update the web ui
     // might be that internally they use the last revision to create the next revision
     pub queue_revision: String,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub logging_params: LoggingParams,
 }
 
@@ -158,7 +166,7 @@ pub struct SetOptionsCommand {
     #[serde(default)]
     pub modes: Option<HashMap<String, String>>,
     pub options: Option<OptionsOptions>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub logging_params: LoggingParams,
 }
 
@@ -171,6 +179,7 @@ pub struct UpdateContextCommand {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct GenericCommand {
+    #[serde(default, deserialize_with = "null_as_default")]
     pub logging_params: LoggingParams,
 }
 
@@ -223,4 +232,55 @@ pub struct LoggingParams {
     pub command_initiated_time: Option<i64>,
     pub page_instance_ids: Option<Vec<String>>,
     pub command_id: Option<String>,
+}
+
+/// A field social-connect sends as `null` (a Jam's transfers carry
+/// `"logging_params": null`), read as its default. Without this the whole
+/// command failed to parse and arrived as an unknown endpoint.
+fn null_as_default<'de, T, D>(de: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<T>::deserialize(de)?.unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Jam's transfer, as social-connect sends it: no logging params.
+    #[test]
+    fn a_jam_transfer_with_null_logging_params_parses() {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "message_id": 1,
+            "sent_by_device_id": "social-connect-970b22d038817320963d7b29028089ec",
+            "command": {
+                "endpoint": "transfer",
+                "from_device_identifier": "social-connect-970b22d038817320963d7b29028089ec",
+                "logging_params": null,
+                "options": {
+                    "restore_paused": "restore",
+                    "restore_position": "extrapolate",
+                    "restore_track": "only_current",
+                    "retain_session": "retain_original"
+                }
+            }
+        }))
+        .unwrap();
+        let Command::Transfer(transfer) = request.command else {
+            panic!("not a transfer: {:?}", request.command);
+        };
+        assert_eq!(
+            transfer.options.retain_session.as_deref(),
+            Some("retain_original")
+        );
+        assert!(transfer.logging_params.command_id.is_none());
+
+        let pause: Command = serde_json::from_value(
+            serde_json::json!({"endpoint": "pause", "logging_params": null}),
+        )
+        .unwrap();
+        assert!(matches!(pause, Command::Pause(_)));
+    }
 }
