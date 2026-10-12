@@ -188,6 +188,18 @@ fn continues_stream(
         && (playing.uid.is_empty() || next.uid.is_empty() || playing.uid == next.uid)
 }
 
+/// Where a transferred track is now. A playing track has moved on since
+/// the position was taken, so it is extrapolated from its timestamp, even
+/// from zero: a Jam's transfer gives position 0 as of when the track
+/// started, and expects the device to catch up to where everyone is.
+fn transfer_position(position: Option<i32>, timestamp: Option<i64>, paused: bool, now: i64) -> i64 {
+    let position = i64::from(position.unwrap_or_default());
+    match timestamp {
+        Some(timestamp) if !paused && timestamp > 0 => (position + now - timestamp).max(0),
+        _ => position,
+    }
+}
+
 static SPIRC_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
@@ -1444,17 +1456,18 @@ impl SpircTask {
             ContextType::Default
         };
 
-        // update position if the track continued playing
-        let transfer_timestamp = transfer.playback.timestamp.unwrap_or_default();
-        let position = match transfer.playback.position_as_of_timestamp {
-            Some(position) if transfer.playback.is_paused.unwrap_or_default() => position.into(),
-            // update position if the track continued playing
-            Some(position) if position > 0 => {
-                let time_since_position_update = timestamp - transfer_timestamp;
-                i64::from(position) + time_since_position_update
-            }
-            _ => 0,
-        };
+        debug!(
+            "transfer playback: position {:?} as of {:?}, paused {:?}, now {timestamp}",
+            transfer.playback.position_as_of_timestamp,
+            transfer.playback.timestamp,
+            transfer.playback.is_paused,
+        );
+        let position = transfer_position(
+            transfer.playback.position_as_of_timestamp,
+            transfer.playback.timestamp,
+            transfer.playback.is_paused.unwrap_or_default(),
+            timestamp,
+        );
 
         let is_playing = !transfer.playback.is_paused();
 
@@ -2350,6 +2363,30 @@ mod jam_tests {
         };
         assert_eq!(clock.position_at(9_000), 5_000);
         assert_eq!(clock.position_at(i64::MAX), 5_000 + 60 * 60 * 1000);
+    }
+
+    #[test]
+    fn a_playing_transfer_catches_up_to_where_the_track_is_now() {
+        // a Jam's: position 0 as of when the track started, 40 s ago
+        assert_eq!(
+            transfer_position(Some(0), Some(60_000), false, 100_000),
+            40_000
+        );
+        // an ordinary one: 10 s in, taken 2 s ago
+        assert_eq!(
+            transfer_position(Some(10_000), Some(98_000), false, 100_000),
+            12_000
+        );
+        // paused tracks stay where they are
+        assert_eq!(
+            transfer_position(Some(10_000), Some(60_000), true, 100_000),
+            10_000
+        );
+        // without a timestamp there is nothing to extrapolate from
+        assert_eq!(transfer_position(Some(5_000), None, false, 100_000), 5_000);
+        assert_eq!(transfer_position(None, None, false, 100_000), 0);
+        // a clock ahead of ours never makes the position negative
+        assert_eq!(transfer_position(Some(0), Some(105_000), false, 100_000), 0);
     }
 
     #[test]
