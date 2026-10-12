@@ -9,7 +9,10 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fmt::{Display, Formatter};
+use std::{
+    collections::HashMap,
+    fmt::{Display, Formatter},
+};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Request {
@@ -149,7 +152,13 @@ pub struct SetOptionsCommand {
     pub shuffling_context: Option<bool>,
     pub repeating_context: Option<bool>,
     pub repeating_track: Option<bool>,
+    /// Player modes to merge into the current options. A Jam is switched on
+    /// and off this way: social-connect sends a `set_options` carrying only
+    /// `{"modes": {"jam": "on"}}` (or `"off"`).
+    #[serde(default)]
+    pub modes: Option<HashMap<String, String>>,
     pub options: Option<OptionsOptions>,
+    #[serde(default)]
     pub logging_params: LoggingParams,
 }
 
@@ -207,7 +216,7 @@ pub struct SkipTo {
     pub track_index: Option<u32>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct LoggingParams {
     pub interaction_ids: Option<Vec<String>>,
     pub device_identifier: Option<String>,
