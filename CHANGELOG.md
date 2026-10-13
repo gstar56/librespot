@@ -37,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [playback] Add `Player::prefetch` to fetch the metadata and first 128 KiB of upcoming tracks, and the audio key of the next one, so loading one of them starts playing without waiting for those in turn; `Spirc` prefetches the next two tracks. The key is not prefetched while the session backs off after a refused key
 - [audio] Add `AudioFileHead` and `AudioFile::open_with_head` to open a file from its first bytes fetched ahead of time
 - [core] Add `SpClient::get_collection_page` and `SpClient::write_collection` to read and change the user's collection sets, such as `playcontextbans`, the tracks hidden in a playlist
+- [core] Add `SpClient::get_context_url` and `SpClient::get_context_page` to resolve a context, or its next page, from the `hm://` url it carries
+- [core] Add `SpClient::get_narration_url`, which turns a DJ narration script into the url of its synthesized audio
 
 ### Changed
 
