@@ -2669,7 +2669,8 @@ impl SpircTask {
             _ => (),
         }
 
-        if let Some(track_id) = self.connect_state.preview_next_track() {
+        if let Some((track_id, narration)) = self.connect_state.preview_next_track() {
+            self.player.set_narration(track_id.clone(), narration);
             self.player.preload(track_id);
         }
     }
@@ -2893,6 +2894,8 @@ impl SpircTask {
 
         let current_uri = self.connect_state.current_track(|t| &t.uri);
         let id = SpotifyUri::from_uri(current_uri)?;
+        self.player
+            .set_narration(id.clone(), self.connect_state.current_narration());
         self.player.load(id, start_playing, position_ms);
 
         self.connect_state

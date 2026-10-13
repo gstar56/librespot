@@ -57,6 +57,17 @@ pub(super) trait Metadata {
         self.metadata().get(entry)
     }
 
+    /// The lines DJ speaks around this item: its `narration.*` entries.
+    fn narration(&self) -> Option<HashMap<String, String>> {
+        let narration: HashMap<_, _> = self
+            .metadata()
+            .iter()
+            .filter(|(key, _)| key.starts_with("narration."))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        (!narration.is_empty()).then_some(narration)
+    }
+
     metadata_entry!(is_from_queue use get_bool, set_from_queue, remove_from_queue (is_queued: IS_QUEUED) -> bool);
     metadata_entry!(is_from_autoplay use get_bool, set_from_autoplay, remove_from_autoplay (is_autoplay: IS_AUTOPLAY) -> bool);
     metadata_entry!(is_suggestion use get_bool, set_suggestion, remove_suggestion (is_suggestion: IS_SUGGESTION) -> bool);

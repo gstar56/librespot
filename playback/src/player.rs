@@ -33,6 +33,7 @@ use crate::{
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
+    narration::{self, Narration},
 };
 use futures_util::{
     FutureExt, StreamExt, TryFutureExt, future, future::FusedFuture,
@@ -108,6 +109,7 @@ struct PlayerInternal {
     normalisation_knee_factor: f64,
 
     auto_normalise_as_album: bool,
+    narrations: HashMap<SpotifyUri, Narration>,
 
     player_id: usize,
     play_request_id_generator: SeqGenerator<u64>,
@@ -184,6 +186,10 @@ enum PlayerCommand {
         track_id: SpotifyUri,
     },
     Prefetch(Vec<SpotifyUri>),
+    SetNarration {
+        track_id: SpotifyUri,
+        narration: Option<Narration>,
+    },
     Play,
     Pause,
     Stop,
@@ -407,6 +413,19 @@ pub fn db_to_ratio(db: f64) -> f64 {
     f64::powf(10.0, db / DB_VOLTAGE_RATIO)
 }
 
+/// The config with `Auto` normalisation settled to what the context asks for.
+fn resolve_auto_normalisation(config: &PlayerConfig, as_album: bool) -> PlayerConfig {
+    let mut config = config.clone();
+    if config.normalisation_type == NormalisationType::Auto {
+        config.normalisation_type = if as_album {
+            NormalisationType::Album
+        } else {
+            NormalisationType::Track
+        };
+    }
+    config
+}
+
 #[inline]
 pub fn ratio_to_db(ratio: f64) -> f64 {
     ratio.log10() * DB_VOLTAGE_RATIO
@@ -618,6 +637,7 @@ impl Player {
                 normalisation_knee_factor,
 
                 auto_normalise_as_album: false,
+                narrations: HashMap::new(),
 
                 player_id,
                 play_request_id_generator: SeqGenerator::new(0),
@@ -679,6 +699,15 @@ impl Player {
     /// decoded and only the head of each file is downloaded.
     pub fn prefetch(&self, track_ids: Vec<SpotifyUri>) {
         self.command(PlayerCommand::Prefetch(track_ids));
+    }
+
+    /// Gives a track the DJ lines to speak around it the next time it loads,
+    /// or takes them away. Send it before the `load` or `preload` it is for.
+    pub fn set_narration(&self, track_id: SpotifyUri, narration: Option<Narration>) {
+        self.command(PlayerCommand::SetNarration {
+            track_id,
+            narration,
+        });
     }
 
     pub fn play(&self) {
@@ -1104,6 +1133,7 @@ struct PlayerTrackLoader {
     session: Session,
     config: PlayerConfig,
     local_file_lookup: Arc<LocalFileLookup>,
+    normalise_as_album: bool,
 }
 
 impl PlayerTrackLoader {
@@ -1166,6 +1196,32 @@ impl PlayerTrackLoader {
     }
 
     async fn load_track(
+        &self,
+        track_uri: SpotifyUri,
+        position_ms: u32,
+        prefetched: Option<Prefetched>,
+        narration: Option<Narration>,
+    ) -> Result<PlayerLoadedTrackData, LoadError> {
+        let mut loaded = self
+            .load_bare_track(track_uri, position_ms, prefetched)
+            .await?;
+        if let Some(narration) = narration {
+            let config = resolve_auto_normalisation(&self.config, self.normalise_as_album);
+            let track_factor = NormalisationData::get_factor(&config, loaded.normalisation_data);
+            loaded.decoder = narration::narrate(
+                &self.session,
+                &self.config,
+                &narration,
+                position_ms,
+                track_factor,
+                loaded.decoder,
+            )
+            .await;
+        }
+        Ok(loaded)
+    }
+
+    async fn load_bare_track(
         &self,
         track_uri: SpotifyUri,
         position_ms: u32,
@@ -2201,14 +2257,7 @@ impl PlayerInternal {
 
         let position_ms = loaded_track.stream_position_ms;
 
-        let mut config = self.config.clone();
-        if config.normalisation_type == NormalisationType::Auto {
-            if self.auto_normalise_as_album {
-                config.normalisation_type = NormalisationType::Album;
-            } else {
-                config.normalisation_type = NormalisationType::Track;
-            }
-        };
+        let config = resolve_auto_normalisation(&self.config, self.auto_normalise_as_album);
         let normalisation_factor =
             NormalisationData::get_factor(&config, loaded_track.normalisation_data);
         if let Some(report) = &config.normalisation_report {
@@ -2481,6 +2530,7 @@ impl PlayerInternal {
             session: self.session.clone(),
             config: self.config.clone(),
             local_file_lookup: self.local_file_lookup.clone(),
+            normalise_as_album: self.auto_normalise_as_album,
         }
     }
 
@@ -2738,6 +2788,23 @@ impl PlayerInternal {
                 prev_tracks,
             }),
 
+            PlayerCommand::SetNarration {
+                track_id,
+                narration,
+            } => match narration {
+                Some(narration) => {
+                    // Only the playing and next tracks' lines matter, and those arrive
+                    // right before their loads, so a wholesale clear bounds the map.
+                    if self.narrations.len() >= 16 {
+                        self.narrations.clear();
+                    }
+                    self.narrations.insert(track_id, narration);
+                }
+                None => {
+                    self.narrations.remove(&track_id);
+                }
+            },
+
             PlayerCommand::EmitFilterExplicitContentChangedEvent(filter) => {
                 self.send_event(PlayerEvent::FilterExplicitContentChanged { filter });
 
@@ -2799,6 +2866,7 @@ impl PlayerInternal {
             .expect(PREFETCHES_POISON_MSG)
             .remove(&spotify_uri)
             .map(Prefetch::into_prefetched);
+        let narration = self.narrations.get(&spotify_uri).cloned();
 
         let (result_tx, result_rx) = oneshot::channel();
 
@@ -2807,7 +2875,7 @@ impl PlayerInternal {
 
         let load_handle = thread::spawn(move || {
             let mut result_tx = result_tx;
-            let load = loader.load_track(spotify_uri, position_ms, prefetched);
+            let load = loader.load_track(spotify_uri, position_ms, prefetched, narration);
             if let Some(data) = handle.block_on(unless_abandoned(&mut result_tx, load)) {
                 let _ = result_tx.send(data);
             }
@@ -2903,6 +2971,14 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::SetAutoNormaliseAsAlbum(setting) => f
                 .debug_tuple("SetAutoNormaliseAsAlbum")
                 .field(&setting)
+                .finish(),
+            PlayerCommand::SetNarration {
+                track_id,
+                narration,
+            } => f
+                .debug_struct("SetNarration")
+                .field("track_id", &track_id)
+                .field("narration", &narration.is_some())
                 .finish(),
             PlayerCommand::EmitFilterExplicitContentChangedEvent(filter) => f
                 .debug_tuple("EmitFilterExplicitContentChangedEvent")
