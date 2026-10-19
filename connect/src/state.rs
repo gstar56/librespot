@@ -4,6 +4,7 @@ mod metadata;
 mod options;
 pub(super) mod provider;
 mod restrictions;
+pub(super) mod smart_shuffle;
 mod tracks;
 mod transfer;
 
@@ -23,8 +24,10 @@ use crate::{
     },
     state::{
         context::{ContextType, ResetContext, StateContext},
+        metadata::Metadata,
         options::ShuffleState,
         provider::{IsProvider, Provider},
+        smart_shuffle::Suggestions,
     },
 };
 use log::LevelFilter;
@@ -236,6 +239,9 @@ pub(super) struct ConnectState {
     /// a context to keep track of the autoplay context
     autoplay_context: Option<StateContext>,
 
+    /// Songs Smart Shuffle weaves into the shuffled context.
+    suggestions: Suggestions,
+
     /// The volume adjustment per step when handling individual volume adjustments.
     pub volume_step_size: u16,
 }
@@ -254,6 +260,7 @@ impl ConnectState {
         self.context.clone_from(&previous.context);
         self.autoplay_context.clone_from(&previous.autoplay_context);
         self.transfer_shuffle.clone_from(&previous.transfer_shuffle);
+        self.suggestions.clone_from(&previous.suggestions);
         self.update_queue_revision();
     }
 
@@ -523,7 +530,8 @@ impl ConnectState {
         self.update_context_index(self.active_context, new_index + 1)?;
         self.fill_up_context = self.active_context;
 
-        if !self.current_track(|t| t.is_queue() || self.is_skip_track(t, None)) {
+        if !self.current_track(|t| t.is_queue() || t.is_suggestion() || self.is_skip_track(t, None))
+        {
             self.set_current_track(new_index)?;
         }
 

@@ -16,6 +16,10 @@ impl ConnectState {
             return self.shuffle_new();
         }
 
+        // Smart Shuffle is a kind of shuffle, so it ends here too
+        self.set_smart_shuffle(false);
+        self.drop_suggestions()?;
+
         self.reset_context(ResetContext::DefaultIndex);
 
         if self.current_track(MessageField::is_none) {
@@ -24,6 +28,12 @@ impl ConnectState {
 
         match self.current_track(|t| t.get_context_index()) {
             Some(current_index) => self.reset_playback_to_position(Some(current_index)),
+            // a suggestion isn't in the context: carry on after the song before it
+            None if self.current_track(|t| t.is_suggestion()) => {
+                let ctx = self.get_context(ContextType::Default)?;
+                let before = self.find_first_prev_track_index(ctx);
+                self.reset_playback_to_position(before)
+            }
             None => {
                 let ctx = self.get_context(ContextType::Default)?;
                 let current_index = ConnectState::find_index_in_context(ctx, |c| {
