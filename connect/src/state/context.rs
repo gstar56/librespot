@@ -297,7 +297,7 @@ impl ConnectState {
         Ok(Some(next_contexts))
     }
 
-    fn find_first_prev_track_index(&self, ctx: &StateContext) -> Option<usize> {
+    pub(super) fn find_first_prev_track_index(&self, ctx: &StateContext) -> Option<usize> {
         let prev_tracks = self.prev_tracks();
         for i in (0..prev_tracks.len()).rev() {
             let prev_track = prev_tracks.get(i)?;

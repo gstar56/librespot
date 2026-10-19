@@ -11,6 +11,8 @@ const IS_QUEUED: &str = "is_queued";
 const IS_AUTOPLAY: &str = "autoplay.is_autoplay";
 const HIDDEN: &str = "hidden";
 const ITERATION: &str = "iteration";
+/// Marks a song Smart Shuffle wove in; Spotify's own key for it is unknown.
+const IS_SUGGESTION: &str = "smart_shuffle.is_suggestion";
 
 const CUSTOM_CONTEXT_INDEX: &str = "context_index";
 const CUSTOM_SHUFFLE_SEED: &str = "shuffle_seed";
@@ -57,6 +59,7 @@ pub(super) trait Metadata {
 
     metadata_entry!(is_from_queue use get_bool, set_from_queue, remove_from_queue (is_queued: IS_QUEUED) -> bool);
     metadata_entry!(is_from_autoplay use get_bool, set_from_autoplay, remove_from_autoplay (is_autoplay: IS_AUTOPLAY) -> bool);
+    metadata_entry!(is_suggestion use get_bool, set_suggestion, remove_suggestion (is_suggestion: IS_SUGGESTION) -> bool);
     metadata_entry!(is_hidden use get_bool, set_hidden, remove_hidden (is_hidden: HIDDEN) -> bool);
 
     metadata_entry!(get_context_index use get_usize, set_context_index, remove_context_index (context_index: CUSTOM_CONTEXT_INDEX) -> Option<usize>);

@@ -29,6 +29,7 @@ use crate::{
     state::{
         context::{ContextType, ResetContext},
         provider::IsProvider,
+        smart_shuffle::{CONTEXT_ENHANCEMENT, is_recommendation},
         {ConnectConfig, ConnectState},
     },
 };
@@ -39,10 +40,13 @@ use std::{
     future::Future,
     sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::{sync::mpsc, time::sleep};
+use tokio::{
+    sync::mpsc,
+    time::{sleep, timeout},
+};
 
 #[derive(Debug, Error)]
 enum SpircError {
@@ -117,7 +121,30 @@ struct SpircTask {
     jam_hold: bool,
     /// Where the Jam is, as of the last command social-connect relayed.
     jam_clock: Option<JamClock>,
+
+    /// Smart Shuffle suggestions fetched in the background, for a context.
+    suggestions_tx: mpsc::UnboundedSender<(String, Result<Context, Error>)>,
+    suggestions_rx: mpsc::UnboundedReceiver<(String, Result<Context, Error>)>,
+    suggestion_fetch: SuggestionFetch,
 }
+
+/// The Smart Shuffle suggestion requests, one at a time with a backoff.
+#[derive(Default)]
+struct SuggestionFetch {
+    in_flight: bool,
+    /// Not before then, for the context it was set for.
+    retry: Option<(String, Instant)>,
+    failures: u32,
+    /// The Smart Shuffle state and suggestions revision last announced.
+    announced: Option<(bool, u64)>,
+}
+
+const SUGGESTION_TIMEOUT: Duration = Duration::from_secs(20);
+/// After Spotify had nothing new to suggest.
+const SUGGESTION_RETRY_EMPTY: Duration = Duration::from_secs(120);
+/// After a failed request, doubling with each further failure.
+const SUGGESTION_RETRY_ERROR: Duration = Duration::from_secs(30);
+const SUGGESTION_RETRY_MAX: Duration = Duration::from_secs(600);
 
 /// A Jam's playhead, extrapolated from the last command it sent.
 #[derive(Clone, Debug, PartialEq)]
@@ -225,6 +252,7 @@ enum SpircCommand {
     Transfer(Option<TransferRequest>),
     Load(LoadRequest),
     JamHold(bool),
+    SmartShuffle(bool),
 }
 
 const CONTEXT_FETCH_THRESHOLD: usize = 2;
@@ -375,6 +403,7 @@ impl Spirc {
         let player_events = player.get_player_event_channel();
 
         let disconnected_playback = Arc::new(Mutex::new(None));
+        let (suggestions_tx, suggestions_rx) = mpsc::unbounded_channel();
         let mut task = SpircTask {
             disconnected_playback: Arc::clone(&disconnected_playback),
             player,
@@ -411,6 +440,10 @@ impl Spirc {
 
             jam_hold: false,
             jam_clock: None,
+
+            suggestions_tx,
+            suggestions_rx,
+            suggestion_fetch: SuggestionFetch::default(),
         };
 
         let spirc = Spirc {
@@ -521,6 +554,18 @@ impl Spirc {
     /// Does nothing if we are not the active device.
     pub fn shuffle(&self, shuffle: bool) -> Result<(), Error> {
         Ok(self.commands.send(SpircCommand::Shuffle(shuffle))?)
+    }
+
+    /// Switches Smart Shuffle on or off, as Spotify's apps do with the
+    /// `context_enhancement` mode. On shuffles the playback if it isn't yet
+    /// and weaves in songs Spotify suggests for the context, one after every
+    /// three of its own; off takes them out again and keeps shuffle on.
+    ///
+    /// Does nothing if we are not the active device.
+    pub fn smart_shuffle(&self, smart_shuffle: bool) -> Result<(), Error> {
+        Ok(self
+            .commands
+            .send(SpircCommand::SmartShuffle(smart_shuffle))?)
     }
 
     /// Repeats the playback context according to the value.
@@ -744,8 +789,13 @@ impl SpircTask {
                         }
                     }
                 },
+                answer = self.suggestions_rx.recv() => if let Some((context_uri, answer)) = answer {
+                    self.handle_suggestions(context_uri, answer)
+                },
                 else => break
             }
+
+            self.sync_smart_shuffle();
         }
 
         if !self.shutdown && self.connect_state.is_active() {
@@ -904,6 +954,7 @@ impl SpircTask {
             SpircCommand::VolumeUp => self.handle_volume_up(),
             SpircCommand::VolumeDown => self.handle_volume_down(),
             SpircCommand::Shuffle(shuffle) => self.handle_shuffle(shuffle)?,
+            SpircCommand::SmartShuffle(smart) => self.handle_smart_shuffle(smart)?,
             SpircCommand::Repeat(repeat) => self.handle_repeat_context(repeat)?,
             SpircCommand::RepeatTrack(repeat) => self.handle_repeat_track(repeat),
             SpircCommand::SetPosition(position) => self.handle_seek(position),
@@ -1339,11 +1390,15 @@ impl SpircTask {
                     self.handle_shuffle(shuffle)?;
                 }
 
-                if let Some(modes) = set_options.modes {
+                if let Some(mut modes) = set_options.modes {
+                    let enhancement = modes.remove(CONTEXT_ENHANCEMENT);
                     self.connect_state.merge_modes(modes);
                     if self.connect_state.mode("jam") == Some("off") {
                         self.jam_hold = false;
                         self.jam_clock = None;
+                    }
+                    if let Some(mode) = enhancement {
+                        self.handle_smart_shuffle(is_recommendation(&mode))?
                     }
                 }
             }
@@ -1669,6 +1724,9 @@ impl SpircTask {
             );
 
             self.connect_state.set_shuffle(options.shuffle);
+            if let Some(smart_shuffle) = options.smart_shuffle {
+                self.connect_state.set_smart_shuffle(smart_shuffle);
+            }
             self.connect_state.set_repeat_context(options.repeat);
             self.connect_state.set_repeat_track(options.repeat_track);
         }
@@ -1890,6 +1948,88 @@ impl SpircTask {
     fn handle_shuffle(&mut self, shuffle: bool) -> Result<(), Error> {
         self.player.emit_shuffle_changed_event(shuffle);
         self.connect_state.handle_shuffle(shuffle)
+    }
+
+    fn handle_smart_shuffle(&mut self, smart_shuffle: bool) -> Result<(), Error> {
+        if smart_shuffle && !self.connect_state.shuffling_context() {
+            self.player.emit_shuffle_changed_event(true);
+        }
+        self.connect_state.handle_smart_shuffle(smart_shuffle)
+    }
+
+    /// Announces Smart Shuffle changes to the player's listeners, and asks
+    /// Spotify for more suggestions when the coming slots need them.
+    fn sync_smart_shuffle(&mut self) {
+        let smart_shuffle = self.connect_state.smart_shuffle();
+        let announce = (smart_shuffle, self.connect_state.suggestions_revision());
+        if self.suggestion_fetch.announced != Some(announce) {
+            self.suggestion_fetch.announced = Some(announce);
+            self.player.emit_smart_shuffle_changed_event(
+                smart_shuffle,
+                self.connect_state.suggestion_uris(),
+            );
+        }
+
+        let context_uri = self.connect_state.context_uri();
+        let waiting = matches!(
+            &self.suggestion_fetch.retry,
+            Some((uri, at)) if uri == context_uri && Instant::now() < *at
+        );
+        if self.suggestion_fetch.in_flight
+            || waiting
+            || !self.connect_state.is_active()
+            || !self.connect_state.needs_suggestions()
+        {
+            return;
+        }
+        let Some(request) = self.connect_state.suggestion_request() else {
+            return;
+        };
+
+        let context_uri = context_uri.clone();
+        debug!("smart shuffle: asking for suggestions for <{context_uri}>");
+        self.suggestion_fetch.in_flight = true;
+        let session = self.session.clone();
+        let answers = self.suggestions_tx.clone();
+        tokio::spawn(async move {
+            let answer = timeout(
+                SUGGESTION_TIMEOUT,
+                session.spclient().get_autoplay_context(&request),
+            )
+            .await
+            .unwrap_or_else(|_| Err(Error::deadline_exceeded("smart shuffle suggestions")));
+            // fails only once the spirc task has ended
+            let _ = answers.send((context_uri, answer));
+        });
+    }
+
+    fn handle_suggestions(&mut self, context_uri: String, answer: Result<Context, Error>) {
+        self.suggestion_fetch.in_flight = false;
+        let added =
+            answer.and_then(|answer| self.connect_state.add_suggestions(&context_uri, answer));
+
+        let fetch = &mut self.suggestion_fetch;
+        let wait = match added {
+            Ok(0) => {
+                fetch.failures = 0;
+                Some(SUGGESTION_RETRY_EMPTY)
+            }
+            Ok(added) => {
+                debug!("smart shuffle: wove in {added} suggestions");
+                fetch.failures = 0;
+                self.update_state = true;
+                None
+            }
+            Err(why) => {
+                fetch.failures = fetch.failures.saturating_add(1);
+                let wait = SUGGESTION_RETRY_ERROR
+                    .saturating_mul(2u32.saturating_pow(fetch.failures - 1))
+                    .min(SUGGESTION_RETRY_MAX);
+                warn!("smart shuffle: suggestions failed, asking again in {wait:?}: {why}");
+                Some(wait)
+            }
+        };
+        fetch.retry = wait.map(|wait| (context_uri, Instant::now() + wait));
     }
 
     fn handle_repeat_context(&mut self, repeat: bool) -> Result<(), Error> {

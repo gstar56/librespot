@@ -1,5 +1,7 @@
 use crate::{
-    core::dealer::protocol::SkipTo, protocol::context_player_options::ContextPlayerOptionOverrides,
+    core::dealer::protocol::SkipTo,
+    protocol::context_player_options::ContextPlayerOptionOverrides,
+    state::smart_shuffle::{CONTEXT_ENHANCEMENT, is_recommendation},
 };
 
 use std::ops::Deref;
@@ -70,6 +72,9 @@ pub struct Options {
     pub repeat: bool,
     /// Start the context, repeating the first track until skipped or manually disabled
     pub repeat_track: bool,
+    /// Start the context in Smart Shuffle (with `shuffle`), or not; `None`
+    /// keeps what was set before
+    pub smart_shuffle: Option<bool>,
 }
 
 impl From<ContextPlayerOptionOverrides> for Options {
@@ -78,6 +83,10 @@ impl From<ContextPlayerOptionOverrides> for Options {
             shuffle: value.shuffling_context.unwrap_or_default(),
             repeat: value.repeating_context.unwrap_or_default(),
             repeat_track: value.repeating_track.unwrap_or_default(),
+            smart_shuffle: value
+                .modes
+                .get(CONTEXT_ENHANCEMENT)
+                .map(|mode| is_recommendation(mode)),
         }
     }
 }
@@ -164,4 +173,25 @@ pub(super) enum SpircPlayStatus {
         position_ms: u32,
         preloading_of_next_track_triggered: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_play_command_names_smart_shuffle_in_its_modes() {
+        let overrides = |mode: Option<&str>| ContextPlayerOptionOverrides {
+            shuffling_context: Some(true),
+            modes: mode
+                .map(|mode| (CONTEXT_ENHANCEMENT.to_owned(), mode.to_owned()))
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let smart = |mode| Options::from(overrides(mode)).smart_shuffle;
+        assert_eq!(smart(Some("RECOMMENDATION")), Some(true));
+        assert_eq!(smart(Some("NONE")), Some(false));
+        assert_eq!(smart(None), None, "without the mode, keep what was set");
+    }
 }

@@ -58,7 +58,7 @@ impl<'ct> ConnectState {
     }
 
     /// top => bottom, aka the first track of the list is the next track
-    fn next_tracks_mut(&mut self) -> &mut Vec<ProvidedTrack> {
+    pub(super) fn next_tracks_mut(&mut self) -> &mut Vec<ProvidedTrack> {
         &mut self.player_mut().next_tracks
     }
 
@@ -135,7 +135,11 @@ impl<'ct> ConnectState {
 
         self.fill_up_next_tracks()?;
 
-        let update_index = if new_track.is_queue() {
+        // a suggestion keeps the context where it is
+        let keep_index = new_track.is_suggestion();
+        self.suggestion_played(&new_track);
+
+        let update_index = if new_track.is_queue() || keep_index {
             None
         } else if new_track.is_autoplay() {
             self.set_active_context(ContextType::Autoplay);
@@ -152,7 +156,7 @@ impl<'ct> ConnectState {
 
         if let Some(update_index) = update_index {
             self.update_current_index(|i| i.track = update_index)
-        } else {
+        } else if !keep_index {
             self.player_mut().index.clear()
         }
 
@@ -292,6 +296,11 @@ impl<'ct> ConnectState {
         let mut iteration = ctx.index.page;
 
         while self.next_tracks().len() < SPOTIFY_MAX_NEXT_TRACKS_SIZE {
+            if let Some(suggestion) = self.suggestion_before(new_index, iteration) {
+                self.next_tracks_mut().push(suggestion);
+                continue;
+            }
+
             let ctx = self.get_context(self.fill_up_context)?;
             let track = match ctx.tracks.get(new_index) {
                 None if self.repeat_context() => {

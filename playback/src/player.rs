@@ -133,6 +133,10 @@ enum PlayerCommand {
     },
     EmitFilterExplicitContentChangedEvent(bool),
     EmitShuffleChangedEvent(bool),
+    EmitSmartShuffleChangedEvent {
+        smart_shuffle: bool,
+        suggestions: Vec<String>,
+    },
     EmitRepeatChangedEvent {
         context: bool,
         track: bool,
@@ -242,6 +246,12 @@ pub enum PlayerEvent {
     },
     ShuffleChanged {
         shuffle: bool,
+    },
+    /// Smart Shuffle switched, or its suggestions changed: the songs it
+    /// weaves into the context, in the order they play.
+    SmartShuffleChanged {
+        smart_shuffle: bool,
+        suggestions: Vec<String>,
     },
     RepeatChanged {
         context: bool,
@@ -646,6 +656,13 @@ impl Player {
 
     pub fn emit_shuffle_changed_event(&self, shuffle: bool) {
         self.command(PlayerCommand::EmitShuffleChangedEvent(shuffle));
+    }
+
+    pub fn emit_smart_shuffle_changed_event(&self, smart_shuffle: bool, suggestions: Vec<String>) {
+        self.command(PlayerCommand::EmitSmartShuffleChangedEvent {
+            smart_shuffle,
+            suggestions,
+        });
     }
 
     pub fn emit_repeat_changed_event(&self, context: bool, track: bool) {
@@ -2361,6 +2378,14 @@ impl PlayerInternal {
                 self.send_event(PlayerEvent::ShuffleChanged { shuffle })
             }
 
+            PlayerCommand::EmitSmartShuffleChangedEvent {
+                smart_shuffle,
+                suggestions,
+            } => self.send_event(PlayerEvent::SmartShuffleChanged {
+                smart_shuffle,
+                suggestions,
+            }),
+
             PlayerCommand::EmitAutoPlayChangedEvent(auto_play) => {
                 self.send_event(PlayerEvent::AutoPlayChanged { auto_play })
             }
@@ -2588,6 +2613,14 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::EmitShuffleChangedEvent(shuffle) => f
                 .debug_tuple("EmitShuffleChangedEvent")
                 .field(&shuffle)
+                .finish(),
+            PlayerCommand::EmitSmartShuffleChangedEvent {
+                smart_shuffle,
+                suggestions,
+            } => f
+                .debug_struct("EmitSmartShuffleChangedEvent")
+                .field("smart_shuffle", &smart_shuffle)
+                .field("suggestions", &suggestions.len())
                 .finish(),
             PlayerCommand::EmitRepeatChangedEvent { context, track } => f
                 .debug_tuple("EmitRepeatChangedEvent")
