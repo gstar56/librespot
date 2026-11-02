@@ -32,6 +32,9 @@ pub const SMART_SHUFFLE_INTERVAL: usize = 3;
 const LOOKAHEAD: usize = 8;
 /// Songs of the context a request bases its suggestions on.
 const SEEDS: usize = 5;
+/// The context librespot gives a plain list of songs, which Spotify can't
+/// suggest anything for.
+const SONG_LIST: &str = "spotify:web-api";
 
 /// Whether a `context_enhancement` mode value asks for Smart Shuffle.
 pub fn is_recommendation(mode: &str) -> bool {
@@ -83,6 +86,17 @@ impl ConnectState {
             self.handle_shuffle(true)?;
         }
         Ok(())
+    }
+
+    /// Forgets the suggestions, for a new playback. Every plain list of
+    /// songs has the same context uri, so a new one can't be told apart
+    /// from the last by it.
+    pub fn forget_suggestions(&mut self) {
+        let revision = self.suggestions.revision + 1;
+        self.suggestions = Suggestions {
+            revision,
+            ..Default::default()
+        };
     }
 
     /// Forgets the suggestions and takes them out of the next tracks.
@@ -154,11 +168,18 @@ impl ConnectState {
             return None;
         }
         let mut rng = rand::rng();
-        let recent_track_uri = (0..SEEDS.min(songs.len()))
+        let recent_track_uri: Vec<String> = (0..SEEDS.min(songs.len()))
             .map(|_| songs[rng.random_range(0..songs.len())].to_owned())
             .collect();
+        // Spotify answers a plain list of songs with 400 Bad Request, so
+        // that is based on one of its songs instead
+        let context_uri = if context_uri.starts_with(SONG_LIST) {
+            recent_track_uri[0].clone()
+        } else {
+            context_uri.to_owned()
+        };
         Some(AutoplayContextRequest {
-            context_uri: Some(context_uri.to_owned()),
+            context_uri: Some(context_uri),
             recent_track_uri,
             ..Default::default()
         })
@@ -462,6 +483,33 @@ mod tests {
             .unwrap();
         assert_eq!(added, 0);
         assert!(state.needs_suggestions());
+    }
+
+    #[tokio::test]
+    async fn a_list_of_songs_asks_for_suggestions_by_one_of_them() {
+        let mut state = state();
+        state
+            .update_context(context(SONG_LIST, "1", 12), ContextType::Default)
+            .unwrap();
+        state.set_current_track(0).unwrap();
+        let request = state.suggestion_request().unwrap();
+        let based_on = request.context_uri.unwrap();
+        assert!(based_on.starts_with("spotify:track:1"), "{based_on}");
+        assert!(request.recent_track_uri.contains(&based_on));
+    }
+
+    #[tokio::test]
+    async fn a_new_playback_forgets_the_last_ones_suggestions() {
+        let mut state = playing(30);
+        state.handle_smart_shuffle(true).unwrap();
+        state
+            .add_suggestions(PLAYLIST, context("spotify:station:x", "2", 20))
+            .unwrap();
+        let revision = state.suggestions_revision();
+        state.forget_suggestions();
+        assert!(state.suggestion_uris().is_empty());
+        assert!(state.needs_suggestions());
+        assert_ne!(state.suggestions_revision(), revision);
     }
 
     #[tokio::test]
