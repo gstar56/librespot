@@ -244,15 +244,20 @@ struct SpircTask {
     /// Where the Jam is, as of the last command social-connect relayed.
     jam_clock: Option<JamClock>,
 
-    /// Smart Shuffle suggestions fetched in the background, for a context.
-    suggestions_tx: mpsc::UnboundedSender<(String, Result<Context, Error>)>,
-    suggestions_rx: mpsc::UnboundedReceiver<(String, Result<Context, Error>)>,
+    /// Smart Shuffle suggestions fetched in the background, for a playback.
+    suggestions_tx: mpsc::UnboundedSender<SuggestionAnswer>,
+    suggestions_rx: mpsc::UnboundedReceiver<SuggestionAnswer>,
     suggestion_fetch: SuggestionFetch,
 }
+
+/// Suggestions Spotify answered for a playback (its generation) and context.
+type SuggestionAnswer = (u64, String, Result<Context, Error>);
 
 /// The Smart Shuffle suggestion requests, one at a time with a backoff.
 #[derive(Default)]
 struct SuggestionFetch {
+    /// Counts loads, so that an answer for an earlier playback is dropped.
+    generation: u64,
     in_flight: bool,
     /// Not before then, for the context it was set for.
     retry: Option<(String, Instant)>,
@@ -1052,8 +1057,8 @@ impl SpircTask {
                         }
                     }
                 },
-                answer = self.suggestions_rx.recv() => if let Some((context_uri, answer)) = answer {
-                    self.handle_suggestions(context_uri, answer)
+                answer = self.suggestions_rx.recv() => if let Some((generation, context_uri, answer)) = answer {
+                    self.handle_suggestions(generation, context_uri, answer)
                 },
                 else => break
             }
@@ -2155,6 +2160,14 @@ impl SpircTask {
         page: Option<ContextPage>,
         fallback_index: Option<usize>,
     ) -> Result<(), Error> {
+        // a new playback asks for its own suggestions
+        self.connect_state.forget_suggestions();
+        let fetch = &mut self.suggestion_fetch;
+        fetch.generation += 1;
+        fetch.in_flight = false;
+        fetch.retry = None;
+        fetch.failures = 0;
+
         self.connect_state
             .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
                 ResetContext::WhenDifferent(uri)
@@ -2485,6 +2498,7 @@ impl SpircTask {
         let context_uri = context_uri.clone();
         debug!("smart shuffle: asking for suggestions for <{context_uri}>");
         self.suggestion_fetch.in_flight = true;
+        let generation = self.suggestion_fetch.generation;
         let session = self.session.clone();
         let answers = self.suggestions_tx.clone();
         tokio::spawn(async move {
@@ -2495,11 +2509,20 @@ impl SpircTask {
             .await
             .unwrap_or_else(|_| Err(Error::deadline_exceeded("smart shuffle suggestions")));
             // fails only once the spirc task has ended
-            let _ = answers.send((context_uri, answer));
+            let _ = answers.send((generation, context_uri, answer));
         });
     }
 
-    fn handle_suggestions(&mut self, context_uri: String, answer: Result<Context, Error>) {
+    fn handle_suggestions(
+        &mut self,
+        generation: u64,
+        context_uri: String,
+        answer: Result<Context, Error>,
+    ) {
+        if generation != self.suggestion_fetch.generation {
+            debug!("smart shuffle: dropping suggestions for an earlier playback");
+            return;
+        }
         self.suggestion_fetch.in_flight = false;
         let added =
             answer.and_then(|answer| self.connect_state.add_suggestions(&context_uri, answer));
