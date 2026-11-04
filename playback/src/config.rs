@@ -111,6 +111,9 @@ impl FromStr for NormalisationMethod {
 pub struct PlayerConfig {
     pub bitrate: Bitrate,
     pub gapless: bool,
+    /// How long a track that ends by itself overlaps the next, up to 12
+    /// seconds. Zero plays them one after the other.
+    pub crossfade: Duration,
     pub passthrough: bool,
 
     pub normalisation: bool,
@@ -142,6 +145,7 @@ impl Default for PlayerConfig {
         Self {
             bitrate: Bitrate::default(),
             gapless: true,
+            crossfade: Duration::ZERO,
             normalisation: false,
             normalisation_type: NormalisationType::default(),
             normalisation_method: NormalisationMethod::default(),

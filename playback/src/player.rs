@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    f64::consts::FRAC_PI_2,
     fmt, fs,
     fs::File,
     future::Future,
@@ -45,9 +46,134 @@ use symphonia::core::io::MediaSource;
 use symphonia::core::probe::Hint;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::SAMPLES_PER_SECOND;
+use crate::{NUM_CHANNELS, SAMPLE_RATE, SAMPLES_PER_SECOND};
 
 const PRELOAD_NEXT_TRACK_BEFORE_END_DURATION_MS: u32 = 30000;
+
+/// The longest overlap, as in Spotify's own apps.
+const CROSSFADE_MAX: Duration = Duration::from_secs(12);
+
+/// The frames of the outgoing track written at a time once nothing else
+/// plays under it.
+const CROSSFADE_TAIL_PACKET_FRAMES: usize = 1024;
+
+fn crossfade_frames(crossfade: Duration) -> u64 {
+    let nanos = crossfade.min(CROSSFADE_MAX).as_nanos();
+    (u128::from(SAMPLE_RATE) * nanos / 1_000_000_000) as u64
+}
+
+/// An equal-power ramp from one track to the other. Two songs are
+/// uncorrelated, so a linear one would dip by about 3 dB halfway.
+struct Ramp {
+    left: u64,
+    total: u64,
+}
+
+impl Ramp {
+    fn new(frames: u64) -> Self {
+        Self {
+            left: frames,
+            total: frames,
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.left == 0
+    }
+
+    fn progress(&self) -> f64 {
+        if self.total == 0 {
+            1.0
+        } else {
+            1.0 - (self.left as f64 / self.total as f64)
+        }
+    }
+
+    fn out_gain(&self) -> f64 {
+        (self.progress() * FRAC_PI_2).cos()
+    }
+
+    fn in_gain(&self) -> f64 {
+        (self.progress() * FRAC_PI_2).sin()
+    }
+
+    fn advance(&mut self) {
+        self.left = self.left.saturating_sub(1);
+    }
+}
+
+fn apply_fade_in(samples: &mut [f64], ramp: &mut Ramp) {
+    for frame in samples.chunks_mut(NUM_CHANNELS as usize) {
+        let gain = ramp.in_gain();
+        for sample in frame.iter_mut() {
+            *sample *= gain;
+        }
+        ramp.advance();
+    }
+}
+
+fn mix_tail(samples: &mut [f64], tail: &[f64], ramp: &mut Ramp) {
+    let channels = NUM_CHANNELS as usize;
+    for (frame, tail_frame) in samples.chunks_mut(channels).zip(tail.chunks(channels)) {
+        let gain = ramp.out_gain();
+        for (sample, tail_sample) in frame.iter_mut().zip(tail_frame) {
+            *sample += tail_sample * gain;
+        }
+        ramp.advance();
+    }
+}
+
+/// The end of the track that is fading out, with its own decoder and
+/// normalisation. The two decoders hand out packets of different lengths,
+/// so its samples wait in a queue until the incoming track's packet takes
+/// them.
+struct Outgoing {
+    decoder: Decoder,
+    normalisation_factor: f64,
+    pending: VecDeque<f64>,
+    ramp: Ramp,
+    ended: bool,
+}
+
+impl Outgoing {
+    fn new(decoder: Decoder, normalisation_factor: f64, frames: u64) -> Self {
+        Self {
+            decoder,
+            normalisation_factor,
+            pending: VecDeque::new(),
+            ramp: Ramp::new(frames),
+            ended: false,
+        }
+    }
+
+    fn take(&mut self, frames: usize) -> Vec<f64> {
+        let wanted = frames * NUM_CHANNELS as usize;
+        while self.pending.len() < wanted && !self.ended {
+            match self.decoder.next_packet() {
+                Ok(Some((_, AudioPacket::Samples(samples)))) => {
+                    let factor = self.normalisation_factor;
+                    self.pending
+                        .extend(samples.iter().map(|sample| sample * factor));
+                }
+                Ok(Some(_)) | Ok(None) => self.ended = true,
+                Err(e) => {
+                    warn!("Ending the crossfade, unable to decode the outgoing track: {e:?}");
+                    self.ended = true;
+                }
+            }
+        }
+        let mut taken: Vec<f64> = self
+            .pending
+            .drain(..wanted.min(self.pending.len()))
+            .collect();
+        taken.resize(wanted, 0.0);
+        taken
+    }
+
+    fn finished(&self) -> bool {
+        self.ramp.finished() || (self.ended && self.pending.is_empty())
+    }
+}
 
 /// How much of an upcoming track's file [`Player::prefetch`] downloads ahead:
 /// about three seconds of audio at 320 kbit/s, enough to start playing while
@@ -119,6 +245,14 @@ struct PlayerInternal {
 
     local_file_lookup: Arc<LocalFileLookup>,
     prefetches: Prefetches,
+
+    crossfade: Duration,
+    /// The track fading out under the one playing.
+    outgoing: Option<Outgoing>,
+    /// The playing track's fade in.
+    fade_in: Option<Ramp>,
+    /// The track a crossfade started, until Spirc loads it.
+    adopting: Option<SpotifyUri>,
 }
 
 /// A track's metadata, resolved to the file that will be played.
@@ -201,6 +335,7 @@ enum PlayerCommand {
     SetSinkEventCallback(Option<SinkEventCallback>),
     EmitVolumeChangedEvent(u16),
     SetAutoNormaliseAsAlbum(bool),
+    SetCrossfade(Duration),
     EmitSessionDisconnectedEvent {
         connection_id: String,
         user_name: String,
@@ -618,6 +753,8 @@ impl Player {
             let local_file_lookup =
                 create_local_file_lookup(config.local_file_directories.as_slice());
 
+            let crossfade = config.crossfade.min(CROSSFADE_MAX);
+
             let internal = PlayerInternal {
                 session,
                 config,
@@ -648,6 +785,11 @@ impl Player {
 
                 local_file_lookup: Arc::new(local_file_lookup),
                 prefetches: Arc::default(),
+
+                crossfade,
+                outgoing: None,
+                fade_in: None,
+                adopting: None,
             };
 
             // While PlayerInternal is written as a future, it still contains blocking code.
@@ -761,6 +903,12 @@ impl Player {
 
     pub fn set_auto_normalise_as_album(&self, setting: bool) {
         self.command(PlayerCommand::SetAutoNormaliseAsAlbum(setting));
+    }
+
+    /// How long a track that ends by itself overlaps the next, from the
+    /// next transition on. Capped at 12 seconds; zero turns it off.
+    pub fn set_crossfade(&self, crossfade: Duration) {
+        self.command(PlayerCommand::SetCrossfade(crossfade));
     }
 
     pub fn emit_filter_explicit_content_changed_event(&self, filter: bool) {
@@ -1937,7 +2085,12 @@ impl Future for PlayerInternal {
                     error!("PlayerInternal poll: Invalid PlayerState");
                     exit(1);
                 };
+            } else if self.outgoing.is_some() {
+                self.ensure_sink_running();
+                self.write_tail();
             }
+
+            self.maybe_begin_crossfade();
 
             if let PlayerState::Playing {
                 ref track_id,
@@ -1973,7 +2126,10 @@ impl Future for PlayerInternal {
                 }
             }
 
-            if (!self.state.is_playing()) && all_futures_completed_or_not_ready {
+            if (!self.state.is_playing())
+                && self.outgoing.is_none()
+                && all_futures_completed_or_not_ready
+            {
                 return Poll::Pending;
             }
         }
@@ -2031,6 +2187,7 @@ impl PlayerInternal {
     }
 
     fn handle_player_stop(&mut self) {
+        self.drop_crossfade();
         match self.state {
             PlayerState::Playing {
                 ref track_id,
@@ -2098,6 +2255,7 @@ impl PlayerInternal {
     }
 
     fn handle_pause(&mut self) {
+        self.drop_crossfade();
         match self.state {
             PlayerState::Paused { .. } => self.ensure_sink_stopped(false),
             PlayerState::Playing {
@@ -2136,6 +2294,8 @@ impl PlayerInternal {
             Some((_, mut packet)) => {
                 if !packet.is_empty() {
                     if let AudioPacket::Samples(ref mut data) = packet {
+                        let normalisation_factor = self.mix_crossfade(data, normalisation_factor);
+
                         // Get the volume for the packet. In the case of hardware volume control
                         // this will always be 1.0 (no change).
                         let volume = self.volume_getter.attenuation_factor();
@@ -2255,6 +2415,169 @@ impl PlayerInternal {
         }
     }
 
+    fn crossfade(&self) -> Duration {
+        // Encoded packets cannot be mixed.
+        if self.config.passthrough {
+            Duration::ZERO
+        } else {
+            self.crossfade
+        }
+    }
+
+    fn crossfading(&self) -> bool {
+        self.outgoing.is_some() || self.fade_in.is_some()
+    }
+
+    fn drop_crossfade(&mut self) {
+        self.outgoing = None;
+        self.fade_in = None;
+        self.adopting = None;
+    }
+
+    /// Fades the playing track's samples in and mixes the outgoing track
+    /// under them. Each track is normalised on its own first, so the factor
+    /// left for the rest of the chain is 1.0 while a crossfade runs.
+    fn mix_crossfade(&mut self, data: &mut [f64], normalisation_factor: f64) -> f64 {
+        if !self.crossfading() {
+            return normalisation_factor;
+        }
+        if self.config.normalisation && normalisation_factor != 1.0 {
+            for sample in data.iter_mut() {
+                *sample *= normalisation_factor;
+            }
+        }
+        if let Some(ramp) = &mut self.fade_in {
+            apply_fade_in(data, ramp);
+        }
+        self.fade_in.take_if(|ramp| ramp.finished());
+        let frames = data.len() / NUM_CHANNELS as usize;
+        if let Some(outgoing) = &mut self.outgoing {
+            let tail = outgoing.take(frames);
+            mix_tail(data, &tail, &mut outgoing.ramp);
+        }
+        self.outgoing.take_if(|outgoing| outgoing.finished());
+        1.0
+    }
+
+    /// The outgoing track alone, when the incoming one has stopped first.
+    fn write_tail(&mut self) {
+        let silence = vec![0.0; CROSSFADE_TAIL_PACKET_FRAMES * NUM_CHANNELS as usize];
+        let position = AudioPacketPosition {
+            position_ms: 0,
+            skipped: false,
+        };
+        self.handle_packet(Some((position, AudioPacket::Samples(silence))), 1.0);
+    }
+
+    /// Starts the next track under the end of this one once the end is as
+    /// near as the crossfade is long and the next track is ready. Tracks
+    /// with the DJ's lines never overlap, so it is never talked over.
+    fn maybe_begin_crossfade(&mut self) {
+        let crossfade = self.crossfade();
+        if crossfade.is_zero() || self.outgoing.is_some() || self.playing_narration.is_some() {
+            return;
+        }
+        let remaining = match &self.state {
+            PlayerState::Playing {
+                duration_ms,
+                stream_position_ms,
+                ..
+            } => Duration::from_millis(u64::from(duration_ms.saturating_sub(*stream_position_ms))),
+            _ => return,
+        };
+        if remaining > crossfade {
+            return;
+        }
+        match &self.preload {
+            PlayerPreload::Ready { track_id, .. } if !self.narrations.contains_key(track_id) => {}
+            _ => return,
+        }
+        self.begin_crossfade(crossfade);
+    }
+
+    fn begin_crossfade(&mut self, crossfade: Duration) {
+        let PlayerPreload::Ready {
+            track_id: next_track_id,
+            loaded_track,
+        } = mem::replace(&mut self.preload, PlayerPreload::None)
+        else {
+            return;
+        };
+        let frames = crossfade_frames(crossfade);
+        let (track_id, play_request_id) = match mem::replace(&mut self.state, PlayerState::Invalid)
+        {
+            PlayerState::Playing {
+                track_id,
+                play_request_id,
+                decoder,
+                normalisation_factor,
+                ..
+            } => {
+                let factor = if self.config.normalisation {
+                    normalisation_factor
+                } else {
+                    1.0
+                };
+                self.outgoing = Some(Outgoing::new(decoder, factor, frames));
+                (track_id, play_request_id)
+            }
+            other => {
+                self.state = other;
+                self.preload = PlayerPreload::Ready {
+                    track_id: next_track_id,
+                    loaded_track,
+                };
+                return;
+            }
+        };
+        self.fade_in = Some(Ramp::new(frames));
+        self.adopting = Some(next_track_id.clone());
+        // Spirc moves on to the next track as at any end of track, and its
+        // load of it is taken as the go-ahead for what already plays.
+        self.send_event(PlayerEvent::EndOfTrack {
+            track_id,
+            play_request_id,
+        });
+        let play_request_id = self.play_request_id_generator.get();
+        self.send_event(PlayerEvent::PlayRequestIdChanged { play_request_id });
+        self.start_playback(next_track_id, play_request_id, *loaded_track, true);
+    }
+
+    /// Whether this load is Spirc's answer to a crossfade: the track the
+    /// crossfade started, from the top, while it still runs. Any other load,
+    /// the same song clicked again later included, loads as usual.
+    fn is_adopting(&self, track_id: &SpotifyUri, position_ms: u32) -> bool {
+        position_ms == 0
+            && self.crossfading()
+            && self.adopting.as_ref() == Some(track_id)
+            && matches!(
+                &self.state,
+                PlayerState::Playing { track_id: playing, .. } if playing == track_id
+            )
+    }
+
+    /// Takes the playing track as the one Spirc loaded, without starting it
+    /// again.
+    fn adopt(&mut self, track_id: SpotifyUri, play_request_id: u64) {
+        self.adopting = None;
+        let position_ms = match &mut self.state {
+            PlayerState::Playing {
+                play_request_id: current,
+                stream_position_ms,
+                ..
+            } => {
+                *current = play_request_id;
+                *stream_position_ms
+            }
+            _ => 0,
+        };
+        self.send_event(PlayerEvent::Playing {
+            track_id,
+            play_request_id,
+            position_ms,
+        });
+    }
+
     fn start_playback(
         &mut self,
         track_id: SpotifyUri,
@@ -2342,6 +2665,13 @@ impl PlayerInternal {
             play_request_id_option.unwrap_or(self.play_request_id_generator.get());
 
         self.send_event(PlayerEvent::PlayRequestIdChanged { play_request_id });
+
+        if self.is_adopting(&track_id, position_ms) {
+            self.adopt(track_id, play_request_id);
+            return Ok(());
+        }
+        // A skip, a new context or the end of the queue: no overlap.
+        self.drop_crossfade();
 
         if !self.config.gapless {
             self.ensure_sink_stopped(play);
@@ -2646,6 +2976,7 @@ impl PlayerInternal {
     }
 
     fn handle_command_seek(&mut self, position_ms: u32) -> PlayerResult {
+        self.drop_crossfade();
         // When we are still loading, the user may immediately ask to
         // seek to another position yet the decoder won't be ready for
         // that. In this case just restart the loading process but
@@ -2793,6 +3124,8 @@ impl PlayerInternal {
             PlayerCommand::SetAutoNormaliseAsAlbum(setting) => {
                 self.auto_normalise_as_album = setting
             }
+
+            PlayerCommand::SetCrossfade(crossfade) => self.crossfade = crossfade.min(CROSSFADE_MAX),
 
             PlayerCommand::EmitSetQueueEvent {
                 context_uri,
@@ -3001,6 +3334,9 @@ impl fmt::Debug for PlayerCommand {
                 .debug_tuple("SetAutoNormaliseAsAlbum")
                 .field(&setting)
                 .finish(),
+            PlayerCommand::SetCrossfade(crossfade) => {
+                f.debug_tuple("SetCrossfade").field(&crossfade).finish()
+            }
             PlayerCommand::SetNarration {
                 track_id,
                 narration,
@@ -3290,5 +3626,131 @@ mod abandoned_load_tests {
             std::future::pending::<u32>(),
         ));
         assert_eq!(output, None);
+    }
+}
+
+#[cfg(test)]
+mod crossfade_tests {
+    use std::f64::consts::FRAC_1_SQRT_2;
+    use std::time::Duration;
+
+    use super::{
+        AudioPacket, AudioPacketPosition, CROSSFADE_MAX, Outgoing, Ramp, apply_fade_in,
+        crossfade_frames, mix_tail,
+    };
+    use crate::decoder::{AudioDecoder, DecoderError, DecoderResult};
+
+    struct StubDecoder {
+        packets: Vec<Vec<f64>>,
+    }
+
+    impl AudioDecoder for StubDecoder {
+        fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError> {
+            Ok(position_ms)
+        }
+
+        fn next_packet(&mut self) -> DecoderResult<Option<(AudioPacketPosition, AudioPacket)>> {
+            if self.packets.is_empty() {
+                return Ok(None);
+            }
+            let samples = self.packets.remove(0);
+            Ok(Some((
+                AudioPacketPosition {
+                    position_ms: 0,
+                    skipped: false,
+                },
+                AudioPacket::Samples(samples),
+            )))
+        }
+    }
+
+    #[test]
+    fn the_ramp_runs_from_one_track_to_the_other() {
+        let mut ramp = Ramp::new(100);
+        assert!((ramp.out_gain() - 1.0).abs() < 1e-9);
+        assert!(ramp.in_gain().abs() < 1e-9);
+        for _ in 0..100 {
+            ramp.advance();
+        }
+        assert!(ramp.finished());
+        assert!(ramp.out_gain().abs() < 1e-9);
+        assert!((ramp.in_gain() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_ramp_keeps_its_power_halfway() {
+        let mut ramp = Ramp::new(100);
+        for _ in 0..50 {
+            ramp.advance();
+        }
+        assert!((ramp.out_gain() - FRAC_1_SQRT_2).abs() < 1e-6);
+        assert!((ramp.out_gain().powi(2) + ramp.in_gain().powi(2) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_fade_in_steps_once_per_frame() {
+        let mut ramp = Ramp::new(4);
+        let mut samples = vec![1.0f64; 8];
+        apply_fade_in(&mut samples, &mut ramp);
+        for frame in samples.chunks(2) {
+            assert_eq!(frame[0], frame[1]);
+        }
+        assert!(samples[0].abs() < 1e-9);
+        assert!(samples[6] > samples[4]);
+        assert!(ramp.finished());
+    }
+
+    #[test]
+    fn the_tail_is_mixed_frame_for_frame() {
+        let mut ramp = Ramp::new(4);
+        let mut samples = vec![0.0f64; 8];
+        mix_tail(&mut samples, &[1.0f64; 8], &mut ramp);
+        assert!((samples[0] - 1.0).abs() < 1e-9);
+        assert!(samples[6] < samples[4]);
+        assert!(ramp.finished());
+    }
+
+    #[test]
+    fn the_tail_spans_packets_of_different_lengths() {
+        let decoder = StubDecoder {
+            packets: vec![vec![1.0; 6], vec![1.0; 2], vec![1.0; 10]],
+        };
+        let mut outgoing = Outgoing::new(Box::new(decoder), 1.0, 100);
+        assert_eq!(outgoing.take(4).len(), 8);
+        assert_eq!(outgoing.take(4).len(), 8);
+        assert!(!outgoing.finished());
+    }
+
+    #[test]
+    fn a_spent_tail_pads_with_silence() {
+        let decoder = StubDecoder {
+            packets: vec![vec![1.0; 4]],
+        };
+        let mut outgoing = Outgoing::new(Box::new(decoder), 1.0, 100);
+        assert_eq!(
+            outgoing.take(4),
+            vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+        );
+        assert!(outgoing.finished());
+    }
+
+    #[test]
+    fn the_tail_keeps_its_own_normalisation() {
+        let decoder = StubDecoder {
+            packets: vec![vec![1.0; 4]],
+        };
+        let mut outgoing = Outgoing::new(Box::new(decoder), 0.5, 100);
+        assert_eq!(outgoing.take(2), vec![0.5, 0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn crossfade_frames_follow_the_sample_rate_and_the_cap() {
+        assert_eq!(crossfade_frames(Duration::from_secs(1)), 44_100);
+        assert_eq!(crossfade_frames(Duration::from_micros(500)), 22);
+        assert_eq!(crossfade_frames(Duration::ZERO), 0);
+        assert_eq!(
+            crossfade_frames(Duration::from_secs(60)),
+            crossfade_frames(CROSSFADE_MAX)
+        );
     }
 }

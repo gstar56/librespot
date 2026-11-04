@@ -1850,6 +1850,7 @@ async fn get_setup() -> Setup {
         PlayerConfig {
             bitrate,
             gapless,
+            crossfade: Duration::ZERO,
             passthrough,
             normalisation,
             normalisation_type,
